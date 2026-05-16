@@ -10,7 +10,7 @@ $EA11CTL_OWNER = 'A11yDevs'
 $EA11CTL_REPO = 'emacs-a11y-vm'
 $EA11CTL_BRANCH = 'main'
 $EA11CTL_RELEASE_BASE_URL = 'https://argmap.inf.ufg.br/a11ydevs'
-#Atalho de start, start corrigido, ssh corrigido.
+
 function Write-EA11Info {
     param([string]$Message)
     Write-Host "[ea11ctl] $Message" -ForegroundColor Cyan
