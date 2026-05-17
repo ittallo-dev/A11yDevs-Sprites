@@ -4,8 +4,31 @@ param(
     [string[]]$Args
 )
 
+# Bootstrap UTF-8 BOM para Windows PowerShell 5:
+# sem BOM, o PS5 interpreta o arquivo como ANSI e corrompe todos os literais acentuados.
+# Ao detectar a ausência de BOM em PS5, re-salva o próprio script com BOM e pede para re-executar.
+if ($PSVersionTable.PSVersion.Major -lt 6 -and $PSCommandPath) {
+    $selfBytes = [System.IO.File]::ReadAllBytes($PSCommandPath)
+    $hasBom = ($selfBytes.Length -ge 3 -and $selfBytes[0] -eq 0xEF -and $selfBytes[1] -eq 0xBB -and $selfBytes[2] -eq 0xBF)
+    if (-not $hasBom) {
+        $bom = [byte[]](0xEF, 0xBB, 0xBF)
+        $withBom = New-Object byte[] ($bom.Length + $selfBytes.Length)
+        [Array]::Copy($bom, $withBom, $bom.Length)
+        [Array]::Copy($selfBytes, 0, $withBom, $bom.Length, $selfBytes.Length)
+        [System.IO.File]::WriteAllBytes($PSCommandPath, $withBom)
+        Write-Host '[ea11ctl] Arquivo atualizado para UTF-8. Execute o comando novamente.' -ForegroundColor Yellow
+        exit 0
+    }
+}
+
+# Garante UTF-8 para exibição correta de caracteres acentuados
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+$OutputEncoding           = [System.Text.Encoding]::UTF8
+
 $ErrorActionPreference = 'Stop'
-$EA11CTL_FALLBACK_VERSION = '0.1.36'
+$script:IsInteractiveShell = $false
+$EA11CTL_FALLBACK_VERSION = '0.1.37'
 $EA11CTL_OWNER = 'A11yDevs'
 $EA11CTL_REPO = 'emacs-a11y-vm'
 $EA11CTL_BRANCH = 'main'
@@ -31,6 +54,7 @@ function Show-Help {
 ea11ctl - CLI do projeto emacs-a11y-vm [HOST - WINDOWS]
 
 Uso:
+  ea11ctl (abre modo interativo)
   ea11ctl help|-h|--help
   ea11ctl version|--version [-c|--check-update]
   ea11ctl self-update|update [-f|--force]
@@ -38,17 +62,22 @@ Uso:
   
   ea11ctl vm install|-i
   ea11ctl vm list|-l
-  ea11ctl vm start|-s [-n|--name VM] [-h|--headless]
+    ea11ctl vm start|-s [-n|--name VM] [-h|--headless] [--debug]
   ea11ctl vm stop|-S [-n|--name VM] [-f|--force]
   ea11ctl vm close|-c [-n|--name VM]
   ea11ctl vm remove|-r|delete [-n|--name VM] [--data] [--system] [--all] [--force] [--yes]
-  ea11ctl vm config [show|path|reset]
+  ea11ctl vm host-share|-H list
+    ea11ctl vm config [show|--raw|list|path|reset|help]
+    ea11ctl vm config get CHAVE [--raw]
+    ea11ctl vm config set CHAVE VALOR
+    ea11ctl vm config set CHAVE=VALOR [CHAVE=VALOR ...]
   ea11ctl vm optimize
   ea11ctl vm diagnose|-d [-n|--name VM] [-L|--lines N]
   ea11ctl vm status|-q [-n|--name VM]
   ea11ctl vm ssh|-x [-u|--user USER] [-p|--port PORT] [-- extra-args]
 
 Nota: Dentro da VM (guest context), execute: ea11ctl share
+Debug: use EA11_DEBUG=1 ou passe --debug em vm start
 "@
 }
 
@@ -406,8 +435,25 @@ function Invoke-SelfUpdate {
             throw "Nao foi possivel baixar arquivos de update. Ultimo erro: $lastErrorMessage"
         }
 
+        $bom = [byte[]](0xEF, 0xBB, 0xBF)
         foreach ($file in $files) {
-            Copy-Item -Path (Join-Path $tmpDir $file) -Destination (Join-Path $installDir $file) -Force
+            $src = Join-Path $tmpDir $file
+            $dst = Join-Path $installDir $file
+            if ($file -like '*.ps1') {
+                # Garante UTF-8 BOM para Windows PowerShell 5.x (sem BOM, PS5 lê como ANSI)
+                $bytes = [System.IO.File]::ReadAllBytes($src)
+                $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+                if (-not $hasBom) {
+                    $withBom = New-Object byte[] ($bom.Length + $bytes.Length)
+                    [Array]::Copy($bom, $withBom, $bom.Length)
+                    [Array]::Copy($bytes, 0, $withBom, $bom.Length, $bytes.Length)
+                    [System.IO.File]::WriteAllBytes($dst, $withBom)
+                } else {
+                    [System.IO.File]::WriteAllBytes($dst, $bytes)
+                }
+            } else {
+                Copy-Item -Path $src -Destination $dst -Force
+            }
         }
     }
     finally {
@@ -573,7 +619,7 @@ function Get-QemuStateFilePath {
 }
 
 function Get-QemuRuntimeConfigPath {
-    return (Join-Path (Get-QemuStateDirectory) 'config.json')
+    return (Join-Path (Get-QemuStateDirectory) 'config.env')
 }
 
 function Get-DefaultQemuRuntimeConfig {
@@ -603,58 +649,43 @@ function Get-DefaultQemuRuntimeConfig {
     }
 
     return @{
-        accel = $accel
-        cpuModel = $cpuModel
-        cpus = 4
-        memoryMb = 4096
-        netDevice = 'virtio-net-pci'
-        diskInterface = 'virtio'
-        diskCache = 'writeback'
-        diskDiscard = 'unmap'
-        videoDevice = 'virtio-vga'
+        QEMU_ACCEL        = $accel
+        QEMU_CPU_MODEL    = $cpuModel
+        QEMU_CPUS         = 4
+        QEMU_MEMORY_MB    = 4096
+        QEMU_NET_DEVICE   = 'virtio-net-pci'
+        QEMU_DISK_IF      = 'virtio'
+        QEMU_DISK_CACHE   = 'writeback'
+        QEMU_DISK_DISCARD = 'unmap'
+        QEMU_VIDEO_DEVICE = 'virtio-vga'
+        QEMU_FULLSCREEN   = 'on'
     }
-}
-
-function Merge-QemuRuntimeConfig {
-    param(
-        [hashtable]$Base,
-        [object]$Override
-    )
-
-    if (-not $Override) {
-        return $Base
-    }
-
-    $merged = @{}
-    foreach ($k in $Base.Keys) {
-        $merged[$k] = $Base[$k]
-    }
-
-    foreach ($prop in $Override.PSObject.Properties) {
-        if ($null -ne $prop.Value -and $merged.ContainsKey($prop.Name)) {
-            $merged[$prop.Name] = $prop.Value
-        }
-    }
-
-    return $merged
 }
 
 function Get-QemuRuntimeConfig {
     $defaults = Get-DefaultQemuRuntimeConfig
     $cfgPath = Get-QemuRuntimeConfigPath
+    $cfgDir = [System.IO.Path]::GetDirectoryName($cfgPath)
+    if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
 
     if (-not (Test-Path $cfgPath)) {
         return $defaults
     }
 
     try {
-        $raw = Get-Content -Path $cfgPath -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            return $defaults
-        }
+        $merged = @{}
+        foreach ($k in $defaults.Keys) { $merged[$k] = $defaults[$k] }
 
-        $parsed = $raw | ConvertFrom-Json
-        return (Merge-QemuRuntimeConfig -Base $defaults -Override $parsed)
+        foreach ($line in (Get-Content -Path $cfgPath -ErrorAction Stop)) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) { continue }
+            $eqIdx = $line.IndexOf('=')
+            if ($eqIdx -lt 0) { continue }
+            $key = $line.Substring(0, $eqIdx).Trim()
+            $val = $line.Substring($eqIdx + 1).Trim()
+            if ($merged.ContainsKey($key)) { $merged[$key] = $val }
+        }
+        return $merged
     }
     catch {
         Write-EA11Warn "Falha ao ler config runtime em $cfgPath. Usando defaults."
@@ -666,23 +697,430 @@ function Save-QemuRuntimeConfig {
     param([hashtable]$Config)
 
     $cfgPath = Get-QemuRuntimeConfigPath
-    $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $cfgPath -Encoding utf8
+    $cfgDir = [System.IO.Path]::GetDirectoryName($cfgPath)
+    if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
+    $lines = @('# Configuracao de runtime do QEMU para ea11ctl', '# Edite com cuidado. Valores invalidos podem impedir o boot.')
+    foreach ($key in ($Config.Keys | Sort-Object)) {
+        $lines += "$key=$($Config[$key])"
+    }
+    ($lines -join "`n") + "`n" | Set-Content -Path $cfgPath -Encoding utf8
 }
 
 function Show-QemuRuntimeConfig {
+    $config = Get-QemuRuntimeConfig
+    foreach ($key in ($config.Keys | Sort-Object)) {
+        Write-Host "$key=$($config[$key])"
+    }
+}
+
+################################################################################
+# Mapeamento de chaves amigáveis para o schema QEMU_* de config
+################################################################################
+
+$Script:ConfigKeyMap = @{
+    'accel'         = 'QEMU_ACCEL'
+    'cpu-model'     = 'QEMU_CPU_MODEL'
+    'cpus'          = 'QEMU_CPUS'
+    'memory'        = 'QEMU_MEMORY_MB'
+    'net-device'    = 'QEMU_NET_DEVICE'
+    'disk-if'       = 'QEMU_DISK_IF'
+    'disk-cache'    = 'QEMU_DISK_CACHE'
+    'disk-discard'  = 'QEMU_DISK_DISCARD'
+    'video'         = 'QEMU_VIDEO_DEVICE'
+    'fullscreen'    = 'QEMU_FULLSCREEN'
+    # aliases PT-BR
+    'memoria'       = 'QEMU_MEMORY_MB'
+    'memória'       = 'QEMU_MEMORY_MB'
+    'processadores' = 'QEMU_CPUS'
+    'tela-cheia'    = 'QEMU_FULLSCREEN'
+    'rede'          = 'QEMU_NET_DEVICE'
+    'vídeo'         = 'QEMU_VIDEO_DEVICE'
+    'video-pt'      = 'QEMU_VIDEO_DEVICE'
+}
+
+$Script:ConfigInternalKeys = @(
+    'accel', 'cpu-model', 'cpus', 'memory', 'net-device',
+    'disk-if', 'disk-cache', 'disk-discard', 'video', 'fullscreen'
+)
+
+function Get-ConfigInternalKey {
+    param([string]$FriendlyKey)
+    $k = $FriendlyKey.ToLowerInvariant()
+    if ($Script:ConfigKeyMap.ContainsKey($k)) {
+        return $Script:ConfigKeyMap[$k]
+    }
+    return $null
+}
+
+function Get-ConfigFriendlyLabel {
+    param([string]$FriendlyKey)
+    switch ($FriendlyKey) {
+        'accel'       { return 'Aceleração' }
+        'cpu-model'   { return 'Modelo de CPU' }
+        'cpus'        { return 'CPUs' }
+        'memory'      { return 'Memória (MB)' }
+        'net-device'  { return 'Dispositivo de rede' }
+        'disk-if'     { return 'Interface de disco' }
+        'disk-cache'  { return 'Cache de disco' }
+        'disk-discard'{ return 'Descarte/TRIM' }
+        'video'       { return 'Dispositivo de vídeo' }
+        'fullscreen'  { return 'Tela cheia' }
+        default       { return $FriendlyKey }
+    }
+}
+
+function Get-ConfigFriendlyDescription {
+    param([string]$FriendlyKey)
+    switch ($FriendlyKey) {
+        'accel'       { return 'Aceleração de hardware usada pelo QEMU.' }
+        'cpu-model'   { return 'Modelo de CPU exposto para a VM.' }
+        'cpus'        { return 'Quantidade de CPUs virtuais.' }
+        'memory'      { return 'Memória RAM da VM, em MB.' }
+        'net-device'  { return 'Dispositivo de rede virtual.' }
+        'disk-if'     { return 'Interface do disco principal.' }
+        'disk-cache'  { return 'Política de cache do disco.' }
+        'disk-discard'{ return 'Política de descarte/TRIM do disco.' }
+        'video'       { return 'Dispositivo de vídeo virtual.' }
+        'fullscreen'  { return 'Inicia a VM em tela cheia.' }
+        default       { return $FriendlyKey }
+    }
+}
+
+function Format-FullscreenLabel {
+    param([string]$Value)
+    if ($Value -eq 'on') { return 'ativado' }
+    if ($Value -eq 'off') { return 'desativado' }
+    return $Value
+}
+
+function ConvertTo-FullscreenNormalized {
+    param([string]$Value)
+    switch ($Value.ToLowerInvariant()) {
+        { $_ -in 'on','true','yes','1','ligado' }   { return 'on' }
+        { $_ -in 'off','false','no','0','desligado' }{ return 'off' }
+        default { return $null }
+    }
+}
+
+function Get-QemuDesktopDisplayArgs {
+    param([string]$FullscreenMode)
+
+    $normalized = ConvertTo-FullscreenNormalized -Value $FullscreenMode
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        $normalized = 'on'
+    }
+
+    if (Test-IsMacOSHost) {
+        return @('-display', "cocoa,zoom-to-fit=on,full-screen=$normalized", '-k', 'en-us')
+    }
+
+    if (Test-IsWindowsHost) {
+        if ($normalized -eq 'on') {
+            return @('-display', 'sdl', '-full-screen')
+        }
+        return @('-display', 'sdl')
+    }
+
+    return @()
+}
+
+function Assert-ConfigValue {
+    # Valida e retorna valor normalizado, ou $null em erro.
+    param([string]$FriendlyKey, [string]$Value)
+    switch ($FriendlyKey) {
+        'cpus' {
+            if ($Value -match '^[1-9][0-9]*$') {
+                $limit = Get-ConfigHostLimitInfo -FriendlyKey 'cpus'
+                if (($null -ne $limit) -and ([int]$Value -gt [int]$limit.Max)) {
+                    Write-Host "Erro: valor acima do máximo disponível para 'cpus'." -ForegroundColor Red
+                    Write-Host ''
+                    Write-Host "Valor recebido: $Value"
+                    Write-Host "Máximo disponível: $($limit.Max) ($($limit.Label))"
+                    Write-Host ''
+                    Write-Host 'Exemplos:'
+                    Write-Host '  ea11ctl vm config set cpus 2'
+                    Write-Host '  ea11ctl vm config set cpus 4'
+                    return $null
+                }
+                return $Value
+            }
+            Write-Host "Erro: valor inválido para 'cpus'." -ForegroundColor Red
+            Write-Host ''
+            Write-Host "Valor recebido: $Value"
+            Write-Host 'Formato esperado: número inteiro positivo.'
+            $limit = Get-ConfigHostLimitInfo -FriendlyKey 'cpus'
+            if ($null -ne $limit) {
+                Write-Host "Máximo disponível: $($limit.Max) ($($limit.Label))"
+            }
+            Write-Host ''
+            Write-Host 'Exemplos:'
+            Write-Host '  ea11ctl vm config set cpus 2'
+            Write-Host '  ea11ctl vm config set cpus 4'
+            Write-Host '  ea11ctl vm config set cpus 8'
+            return $null
+        }
+        'memory' {
+            if ($Value -match '^[1-9][0-9]*$') {
+                $limit = Get-ConfigHostLimitInfo -FriendlyKey 'memory'
+                if (($null -ne $limit) -and ([int]$Value -gt [int]$limit.Max)) {
+                    Write-Host "Erro: valor acima do máximo disponível para 'memory'." -ForegroundColor Red
+                    Write-Host ''
+                    Write-Host "Valor recebido: $Value MB"
+                    Write-Host "Máximo disponível: $($limit.Max) $($limit.Unit) ($($limit.Label))"
+                    Write-Host ''
+                    Write-Host 'Exemplos:'
+                    Write-Host '  ea11ctl vm config set memory 2048'
+                    Write-Host '  ea11ctl vm config set memory 4096'
+                    return $null
+                }
+                return $Value
+            }
+            Write-Host "Erro: valor inválido para 'memory'." -ForegroundColor Red
+            Write-Host ''
+            Write-Host "Valor recebido: $Value"
+            Write-Host 'Formato esperado: número inteiro positivo em MB.'
+            $limit = Get-ConfigHostLimitInfo -FriendlyKey 'memory'
+            if ($null -ne $limit) {
+                Write-Host "Máximo disponível: $($limit.Max) $($limit.Unit) ($($limit.Label))"
+            }
+            Write-Host ''
+            Write-Host 'Exemplos:'
+            Write-Host '  ea11ctl vm config set memory 2048'
+            Write-Host '  ea11ctl vm config set memory 4096'
+            Write-Host '  ea11ctl vm config set memory 8192'
+            return $null
+        }
+        'fullscreen' {
+            $norm = ConvertTo-FullscreenNormalized -Value $Value
+            if ($null -ne $norm) { return $norm }
+            Write-Host "Erro: valor inválido para 'fullscreen'." -ForegroundColor Red
+            Write-Host ''
+            Write-Host "Valor recebido: $Value"
+            Write-Host 'Valores aceitos: on, off, true, false, yes, no, 1, 0, ligado, desligado'
+            Write-Host ''
+            Write-Host 'Exemplos:'
+            Write-Host '  ea11ctl vm config set fullscreen on'
+            Write-Host '  ea11ctl vm config set fullscreen off'
+            return $null
+        }
+        'accel' {
+            $valid = @('hvf','kvm','tcg','whpx','none')
+            if ($valid -contains $Value.ToLowerInvariant()) { return $Value.ToLowerInvariant() }
+            Write-Host "Erro: valor inválido para 'accel'." -ForegroundColor Red
+            Write-Host ''
+            Write-Host "Valor recebido: $Value"
+            Write-Host 'Valores conhecidos: hvf, kvm, tcg, whpx, none'
+            Write-Host ''
+            Write-Host 'Exemplos:'
+            Write-Host '  ea11ctl vm config set accel hvf'
+            Write-Host '  ea11ctl vm config set accel kvm'
+            Write-Host '  ea11ctl vm config set accel tcg'
+            return $null
+        }
+        default { return $Value }
+    }
+}
+
+function Show-QemuRuntimeConfigFriendly {
     $cfgPath = Get-QemuRuntimeConfigPath
+    $cfgDir = [System.IO.Path]::GetDirectoryName($cfgPath)
+    if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
     $cfg = Get-QemuRuntimeConfig
 
-    Write-Host "config_file=$cfgPath"
-    Write-Host "QEMU_ACCEL=$($cfg.accel)"
-    Write-Host "QEMU_CPU_MODEL=$($cfg.cpuModel)"
-    Write-Host "QEMU_CPUS=$($cfg.cpus)"
-    Write-Host "QEMU_MEMORY_MB=$($cfg.memoryMb)"
-    Write-Host "QEMU_NET_DEVICE=$($cfg.netDevice)"
-    Write-Host "QEMU_DISK_IF=$($cfg.diskInterface)"
-    Write-Host "QEMU_DISK_CACHE=$($cfg.diskCache)"
-    Write-Host "QEMU_DISK_DISCARD=$($cfg.diskDiscard)"
-    Write-Host "QEMU_VIDEO_DEVICE=$($cfg.videoDevice)"
+    Write-Host 'Configuração da VM'
+    Write-Host ''
+    Write-Host 'Arquivo:'
+    Write-Host "  $cfgPath"
+    Write-Host ''
+    Write-Host 'Desempenho:'
+    Write-Host "  CPUs: $($cfg['QEMU_CPUS'])"
+    $cpuLimit = Get-ConfigHostLimitInfo -FriendlyKey 'cpus'
+    if ($null -ne $cpuLimit) {
+        Write-Host "  Máximo disponível no host: $($cpuLimit.Max)"
+    }
+    Write-Host "  Memória: $($cfg['QEMU_MEMORY_MB']) MB"
+    $memoryLimit = Get-ConfigHostLimitInfo -FriendlyKey 'memory'
+    if ($null -ne $memoryLimit) {
+        Write-Host "  Máximo disponível no host: $($memoryLimit.Max) MB"
+    }
+    Write-Host "  Aceleração: $($cfg['QEMU_ACCEL'])"
+    Write-Host "  Modelo de CPU: $($cfg['QEMU_CPU_MODEL'])"
+    Write-Host ''
+    Write-Host 'Vídeo:'
+    Write-Host "  Dispositivo: $($cfg['QEMU_VIDEO_DEVICE'])"
+    Write-Host "  Tela cheia: $(Format-FullscreenLabel $cfg['QEMU_FULLSCREEN'])"
+    Write-Host ''
+    Write-Host 'Disco:'
+    Write-Host "  Interface: $($cfg['QEMU_DISK_IF'])"
+    Write-Host "  Cache: $($cfg['QEMU_DISK_CACHE'])"
+    Write-Host "  Descarte/TRIM: $($cfg['QEMU_DISK_DISCARD'])"
+    Write-Host ''
+    Write-Host 'Rede:'
+    Write-Host "  Dispositivo: $($cfg['QEMU_NET_DEVICE'])"
+}
+
+function Show-QemuConfigList {
+    $cfg = Get-QemuRuntimeConfig
+    Write-Host 'Configurações disponíveis:'
+    foreach ($fkey in $Script:ConfigInternalKeys) {
+        $internalKey = Get-ConfigInternalKey -FriendlyKey $fkey
+        $currentVal = $cfg[$internalKey]
+        $description = Get-ConfigFriendlyDescription -FriendlyKey $fkey
+        Write-Host ''
+        Write-Host $fkey
+        Write-Host "  Descrição: $description"
+        Write-Host "  Chave interna: $internalKey"
+        Write-Host "  Valor atual: $currentVal"
+        $limit = Get-ConfigHostLimitInfo -FriendlyKey $fkey
+        if ($null -ne $limit) {
+            $unitSuffix = if ([string]::IsNullOrWhiteSpace($limit.Unit)) { '' } else { " $($limit.Unit)" }
+            Write-Host "  Máximo disponível: $($limit.Max)$unitSuffix ($($limit.Label))"
+        }
+        if ($fkey -in 'fullscreen','accel') {
+            switch ($fkey) {
+                'fullscreen' { Write-Host '  Valores aceitos: on, off' }
+                'accel'      { Write-Host '  Valores aceitos: hvf, kvm, tcg, whpx, none' }
+            }
+        }
+        Write-Host "  Exemplo: ea11ctl vm config set $fkey $currentVal"
+    }
+}
+
+function Show-QemuConfigGet {
+    param([string]$FriendlyKey, [bool]$Raw = $false)
+    $internalKey = Get-ConfigInternalKey -FriendlyKey $FriendlyKey
+    if ($null -eq $internalKey) {
+        Write-Host "Erro: configuração desconhecida: $FriendlyKey" -ForegroundColor Red
+        Write-Host ''
+        Write-Host 'Use:'
+        Write-Host '  ea11ctl vm config list'
+        Write-Host ''
+        Write-Host 'Exemplos:'
+        Write-Host '  ea11ctl vm config get memory'
+        Write-Host '  ea11ctl vm config get cpus'
+        Write-Host '  ea11ctl vm config get fullscreen'
+        return $false
+    }
+    $cfg = Get-QemuRuntimeConfig
+    $currentVal = $cfg[$internalKey]
+    if ($Raw) {
+        Write-Host "$internalKey=$currentVal"
+        return $true
+    }
+    $label = Get-ConfigFriendlyLabel -FriendlyKey $FriendlyKey
+    Write-Host "${label}:"
+    Write-Host "  Chave amigável: $FriendlyKey"
+    Write-Host "  Chave interna: $internalKey"
+    if ($FriendlyKey -eq 'memory') {
+        Write-Host "  Valor atual: $currentVal MB"
+    } else {
+        Write-Host "  Valor atual: $currentVal"
+    }
+    $limit = Get-ConfigHostLimitInfo -FriendlyKey $FriendlyKey
+    if ($null -ne $limit) {
+        $unitSuffix = if ([string]::IsNullOrWhiteSpace($limit.Unit)) { '' } else { " $($limit.Unit)" }
+        Write-Host "  Máximo disponível: $($limit.Max)$unitSuffix ($($limit.Label))"
+    }
+    return $true
+}
+
+function Invoke-QemuConfigSet {
+    param([string[]]$Pairs)
+    $cfg = Get-QemuRuntimeConfig
+    $changedKeys = [System.Collections.Generic.List[string]]::new()
+    $oldValues   = [System.Collections.Generic.List[string]]::new()
+    $newValues   = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($pair in $Pairs) {
+        $eqIdx = $pair.IndexOf('=')
+        if ($eqIdx -lt 0) {
+            Write-Host "Erro: argumento inválido: $pair" -ForegroundColor Red
+            Write-Host 'No modo key=value, todos os argumentos devem conter "=".'
+            Write-Host 'Exemplo: ea11ctl vm config set memory=8192 cpus=4 fullscreen=off'
+            return $false
+        }
+        $fkey  = $pair.Substring(0, $eqIdx).ToLowerInvariant()
+        $fval  = $pair.Substring($eqIdx + 1)
+        $internalKey = Get-ConfigInternalKey -FriendlyKey $fkey
+        if ($null -eq $internalKey) {
+            Write-Host "Erro: configuração desconhecida: $fkey" -ForegroundColor Red
+            Write-Host ''
+            Write-Host 'Use:'
+            Write-Host '  ea11ctl vm config list'
+            Write-Host ''
+            Write-Host 'Exemplos:'
+            Write-Host '  ea11ctl vm config set memory 4096'
+            Write-Host '  ea11ctl vm config set cpus 4'
+            Write-Host '  ea11ctl vm config set fullscreen off'
+            return $false
+        }
+        $normalized = Assert-ConfigValue -FriendlyKey $fkey -Value $fval
+        if ($null -eq $normalized) { return $false }
+
+        $changedKeys.Add($fkey)
+        $oldValues.Add([string]$cfg[$internalKey])
+        $newValues.Add($normalized)
+        $cfg[$internalKey] = $normalized
+    }
+
+    Save-QemuRuntimeConfig -Config $cfg
+    Write-Host 'Configuração atualizada.'
+
+    for ($i = 0; $i -lt $changedKeys.Count; $i++) {
+        $fkey  = $changedKeys[$i]
+        $label = Get-ConfigFriendlyLabel -FriendlyKey $fkey
+        Write-Host ''
+        Write-Host "${label}:"
+        if ($fkey -eq 'memory') {
+            Write-Host "  Valor anterior: $($oldValues[$i]) MB"
+            Write-Host "  Novo valor: $($newValues[$i]) MB"
+        } elseif ($fkey -eq 'fullscreen') {
+            Write-Host "  Valor anterior: $(Format-FullscreenLabel $oldValues[$i])"
+            Write-Host "  Novo valor: $(Format-FullscreenLabel $newValues[$i])"
+        } else {
+            Write-Host "  Valor anterior: $($oldValues[$i])"
+            Write-Host "  Novo valor: $($newValues[$i])"
+        }
+    }
+    Write-Host ''
+    Write-Host 'A alteração será aplicada na próxima vez que a VM for iniciada.'
+    return $true
+}
+
+function Show-QemuConfigHelp {
+    Write-Host 'ea11ctl vm config - Gerenciar configurações da VM'
+    Write-Host ''
+    Write-Host 'Uso:'
+    Write-Host '  ea11ctl vm config                          Mostra configuração amigável'
+    Write-Host '  ea11ctl vm config --raw                    Mostra variáveis técnicas (QEMU_*)'
+    Write-Host '  ea11ctl vm config list                     Lista todas as chaves configuráveis'
+    Write-Host '  ea11ctl vm config get CHAVE [--raw]        Consulta um valor'
+    Write-Host '  ea11ctl vm config set CHAVE VALOR          Define um valor'
+    Write-Host '  ea11ctl vm config set CHAVE=VALOR [...]    Define um ou mais valores'
+    Write-Host '  ea11ctl vm config path                     Mostra caminho do arquivo de config'
+    Write-Host '  ea11ctl vm config reset                    Reseta para valores padrão'
+    Write-Host '  ea11ctl vm config help                     Mostra esta ajuda'
+    Write-Host ''
+    Write-Host 'Chaves disponíveis:'
+    Write-Host '  cpus         memory       accel        cpu-model'
+    Write-Host '  net-device   disk-if      disk-cache   disk-discard'
+    Write-Host '  video        fullscreen'
+    $cpuLimit = Get-ConfigHostLimitInfo -FriendlyKey 'cpus'
+    if ($null -ne $cpuLimit) {
+        Write-Host "  Máximo de cpus no host: $($cpuLimit.Max)"
+    }
+    $memoryLimit = Get-ConfigHostLimitInfo -FriendlyKey 'memory'
+    if ($null -ne $memoryLimit) {
+        Write-Host "  Máximo de memory no host: $($memoryLimit.Max) MB"
+    }
+    Write-Host ''
+    Write-Host 'Exemplos:'
+    Write-Host '  ea11ctl vm config set memory 4096'
+    Write-Host '  ea11ctl vm config set cpus 4'
+    Write-Host '  ea11ctl vm config set fullscreen off'
+    Write-Host '  ea11ctl vm config set memory=8192 cpus=4 fullscreen=off'
+    Write-Host '  ea11ctl vm config get memory'
+    Write-Host '  ea11ctl vm config get memory --raw'
 }
 
 function Invoke-QemuVMConfig {
@@ -694,21 +1132,59 @@ function Invoke-QemuVMConfig {
     }
 
     switch ($action) {
-        'show' { Show-QemuRuntimeConfig }
-        'list' { Show-QemuRuntimeConfig }
+        'show' { Show-QemuRuntimeConfigFriendly }
+        '--raw' { Show-QemuRuntimeConfig }
+        'list' { Show-QemuConfigList }
+        'get' {
+            if ($Tokens.Length -lt 2) {
+                Write-Host 'Erro: informe a chave. Exemplo: ea11ctl vm config get memory' -ForegroundColor Red
+                return
+            }
+            $raw = ($Tokens.Length -ge 3 -and $Tokens[2] -eq '--raw')
+            $ok = Show-QemuConfigGet -FriendlyKey $Tokens[1].ToLowerInvariant() -Raw $raw
+            if (-not $ok) {
+                if ($script:IsInteractiveShell) { return }
+                exit 1
+            }
+        }
+        'set' {
+            if ($Tokens.Length -lt 2) {
+                Write-Host 'Erro: use: ea11ctl vm config set CHAVE VALOR' -ForegroundColor Red
+                Write-Host 'Ou:   ea11ctl vm config set CHAVE=VALOR [CHAVE=VALOR ...]'
+                return
+            }
+            $rest = $Tokens[1..($Tokens.Length - 1)]
+            # Detecta modo key=value ou "CHAVE VALOR"
+            if ($rest[0] -match '=') {
+                $ok = Invoke-QemuConfigSet -Pairs $rest
+            } else {
+                if ($rest.Length -lt 2) {
+                    Write-Host 'Erro: use: ea11ctl vm config set CHAVE VALOR' -ForegroundColor Red
+                    return
+                }
+                $ok = Invoke-QemuConfigSet -Pairs @("$($rest[0])=$($rest[1])")
+            }
+            if (-not $ok) {
+                if ($script:IsInteractiveShell) { return }
+                exit 1
+            }
+        }
         'path' { Write-Host (Get-QemuRuntimeConfigPath) }
         'reset' {
             Save-QemuRuntimeConfig -Config (Get-DefaultQemuRuntimeConfig)
             Write-EA11Info "Configuracao resetada para defaults em $(Get-QemuRuntimeConfigPath)"
         }
+        { $_ -in 'help','-h','--help' } { Show-QemuConfigHelp }
         default {
-            throw "Acao de config desconhecida: $action"
+            throw "Ação de config desconhecida: $action. Use: ea11ctl vm config help"
         }
     }
 }
 
 function Invoke-QemuVMOptimize {
     $cfgPath = Get-QemuRuntimeConfigPath
+    $cfgDir = [System.IO.Path]::GetDirectoryName($cfgPath)
+    if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
     if (Test-Path $cfgPath) {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $backupPath = "$cfgPath.bak-$stamp"
@@ -1028,7 +1504,6 @@ function New-QemuBaseArgs {
         [string]$HostSmbPassword
     )
 
-    # IMPORTANTE:
     # Start-Process recebe ArgumentList como array. Portanto cada item abaixo ja e
     # passado como um argumento separado para o qemu-system-*.
     # Nao coloque aspas internas em file=..., mesmo quando o caminho tem espacos.
@@ -1078,6 +1553,140 @@ function New-QemuBaseArgs {
     return $args
 }
 
+function Get-HostPhysicalMemoryMB {
+    try {
+        if (Test-IsWindowsHost) {
+            if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+                $bytes = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory
+            }
+            else {
+                $bytes = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory
+            }
+            if ($bytes) {
+                return [int]([double]$bytes / 1MB)
+            }
+        }
+        elseif (Test-IsMacOSHost) {
+            $bytes = & sysctl -n hw.memsize 2>$null
+            if ($LASTEXITCODE -eq 0 -and $bytes) {
+                return [int]([double]$bytes / 1MB)
+            }
+        }
+        elseif (Test-Path '/proc/meminfo') {
+            $line = Get-Content -Path '/proc/meminfo' -ErrorAction Stop | Select-String -Pattern '^MemTotal:\s+(\d+)\s+kB$' | Select-Object -First 1
+            if ($line.Matches.Count -gt 0) {
+                return [int]([double]$line.Matches[0].Groups[1].Value / 1024)
+            }
+        }
+    }
+    catch {
+    }
+
+    return $null
+}
+
+function Get-HostLogicalCpuCount {
+    try {
+        if (Test-IsWindowsHost) {
+            if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+                $cpuCount = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).NumberOfLogicalProcessors
+            }
+            else {
+                $cpuCount = (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).NumberOfLogicalProcessors
+            }
+            if ($cpuCount) {
+                return [int]$cpuCount
+            }
+        }
+        elseif (Test-IsMacOSHost) {
+            $cpuCount = & sysctl -n hw.logicalcpu 2>$null
+            if ($LASTEXITCODE -eq 0 -and $cpuCount) {
+                return [int]$cpuCount
+            }
+        }
+        else {
+            $cpuCount = & getconf _NPROCESSORS_ONLN 2>$null
+            if ($LASTEXITCODE -eq 0 -and $cpuCount) {
+                return [int]$cpuCount
+            }
+        }
+    }
+    catch {
+    }
+
+    return $null
+}
+
+function Get-ConfigHostLimitInfo {
+    param([string]$FriendlyKey)
+
+    switch ($FriendlyKey) {
+        'memory' {
+            $max = Get-HostPhysicalMemoryMB
+            if ($null -ne $max) {
+                return @{ Max = $max; Unit = 'MB'; Label = 'RAM física do host' }
+            }
+        }
+        'cpus' {
+            $max = Get-HostLogicalCpuCount
+            if ($null -ne $max) {
+                return @{ Max = $max; Unit = ''; Label = 'CPUs lógicas do host' }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Write-QemuArgsLog {
+    param(
+        [string]$Path,
+        [string]$QemuExecutable,
+        [string[]]$QemuArgs
+    )
+
+    $lines = @('# QEMU arguments for ea11ctl', $QemuExecutable)
+    $lines += $QemuArgs
+    ($lines -join [Environment]::NewLine) + [Environment]::NewLine | Set-Content -Path $Path -Encoding UTF8
+}
+
+function Show-QemuLaunchSummary {
+    param(
+        [string]$VMName,
+        [int]$Memory,
+        [int]$Cpus,
+        [string]$AccelMode,
+        [string]$CpuModel,
+        [string]$NetDevice,
+        [string]$DiskInterface,
+        [string]$DiskCache,
+        [string]$DiskDiscard,
+        [string]$VideoDevice,
+        [string]$FullscreenMode,
+        [bool]$Headless,
+        [int]$SshPort,
+        [string]$QemuExecutable,
+        [string]$ArgsLog
+    )
+
+    Write-EA11Info 'Parâmetros efetivos da inicialização:'
+    Write-Host "  vm=$VMName"
+    Write-Host "  memory_mb=$Memory"
+    Write-Host "  cpus=$Cpus"
+    Write-Host "  accel=$AccelMode"
+    Write-Host "  cpu_model=$CpuModel"
+    Write-Host "  net_device=$NetDevice"
+    Write-Host "  disk_if=$DiskInterface"
+    Write-Host "  disk_cache=$DiskCache"
+    Write-Host "  disk_discard=$DiskDiscard"
+    Write-Host "  video=$VideoDevice"
+    Write-Host "  fullscreen=$FullscreenMode"
+    Write-Host "  headless=$Headless"
+    Write-Host "  ssh_port=$SshPort"
+    Write-Host "  qemu=$QemuExecutable"
+    Write-Host "  qemu_args_log=$ArgsLog"
+}
+
 function Ensure-QemuImg {
     $candidates = @(
         "$env:ProgramFiles\qemu\qemu-img.exe",
@@ -1099,6 +1708,9 @@ function Test-IsWindowsHost {
 
     return ($env:OS -eq 'Windows_NT')
 }
+
+# Criação de atalho para o start da VM facilitado
+# Area de trabalho e Windows/Pesquisar
 
 function Install-EA11VMShortcut {
     param(
@@ -1465,20 +2077,25 @@ function Invoke-QemuVMStart {
 
     $runtimeCfg = Get-QemuRuntimeConfig
 
+    # Detecta modo debug: EA11_DEBUG=1 ou --debug
+    $debugMode = $false
+    if ($env:EA11_DEBUG -eq '1' -or ($Tokens -contains '--debug')) { $debugMode = $true }
+
     $vmName = Get-VMName -Tokens $Tokens
     $sshPort = Get-IntOptionValue -Tokens $Tokens -Names @('--port', '--ssh-port', '-p') -Default 2222 -OptionName '--ssh-port'
-    $memory = Get-IntOptionValue -Tokens $Tokens -Names @('--memory', '-m') -Default ([int]$runtimeCfg.memoryMb) -OptionName '--memory'
-    $cpus = Get-IntOptionValue -Tokens $Tokens -Names @('--cpus') -Default ([int]$runtimeCfg.cpus) -OptionName '--cpus'
+    $memory = Get-IntOptionValue -Tokens $Tokens -Names @('--memory', '-m') -Default ([int]$runtimeCfg['QEMU_MEMORY_MB']) -OptionName '--memory'
+    $cpus = Get-IntOptionValue -Tokens $Tokens -Names @('--cpus') -Default ([int]$runtimeCfg['QEMU_CPUS']) -OptionName '--cpus'
     $userDataSize = Get-IntOptionValue -Tokens $Tokens -Names @('--user-data-size') -Default 10 -OptionName '--user-data-size'
     $headless = Has-Flag -Tokens $Tokens -Flags @('--headless', '-h')
     $audioBackend = Get-OptionValue -Tokens $Tokens -Names @('--audio-backend') -Default 'auto'
-    $accelMode = Get-OptionValue -Tokens $Tokens -Names @('--accel') -Default ([string]$runtimeCfg.accel)
-    $cpuModel = [string]$runtimeCfg.cpuModel
-    $netDevice = [string]$runtimeCfg.netDevice
-    $diskInterface = [string]$runtimeCfg.diskInterface
-    $diskCache = [string]$runtimeCfg.diskCache
-    $diskDiscard = [string]$runtimeCfg.diskDiscard
-    $videoDevice = [string]$runtimeCfg.videoDevice
+    $accelMode = Get-OptionValue -Tokens $Tokens -Names @('--accel') -Default ([string]$runtimeCfg['QEMU_ACCEL'])
+    $cpuModel = [string]$runtimeCfg['QEMU_CPU_MODEL']
+    $netDevice = [string]$runtimeCfg['QEMU_NET_DEVICE']
+    $diskInterface = [string]$runtimeCfg['QEMU_DISK_IF']
+    $diskCache = [string]$runtimeCfg['QEMU_DISK_CACHE']
+    $diskDiscard = [string]$runtimeCfg['QEMU_DISK_DISCARD']
+    $videoDevice = [string]$runtimeCfg['QEMU_VIDEO_DEVICE']
+    $fullscreenMode = [string]$runtimeCfg['QEMU_FULLSCREEN']
     $disableHostHomeShare = Has-Flag -Tokens $Tokens -Flags @('--no-host-home-share')
     $smbServer = Get-OptionValue -Tokens $Tokens -Names @('--smb-server') -Default $null
     $smbShare = Get-OptionValue -Tokens $Tokens -Names @('--smb-share') -Default $null
@@ -1486,6 +2103,8 @@ function Invoke-QemuVMStart {
     $smbPassword = Get-OptionValue -Tokens $Tokens -Names @('--smb-password') -Default $null
     $qemuExecutable = Resolve-QemuSystemExecutable -Headless:$headless
     $supportedAudioDrivers = Get-QemuAvailableAudioDrivers -QemuExecutable $qemuExecutable
+    $effectiveAccelMode = $accelMode
+    $effectiveCpuModel = $cpuModel
 
     $existing = Load-QemuState -VMName $vmName
     if ($existing -and $existing.pid) {
@@ -1500,6 +2119,14 @@ function Invoke-QemuVMStart {
     $logsDir = Get-QemuLogsDirectory
     $stdoutLog = Join-Path $logsDir "$vmName-stdout.log"
     $stderrLog = Join-Path $logsDir "$vmName-stderr.log"
+    $argsLog = Join-Path $logsDir "$vmName-qemu-args.log"
+    $debugCmdFile = Join-Path $logsDir 'last-qemu-cmd.txt'
+    $debugLogFile = Join-Path $logsDir 'qemu.log'
+
+    $hostMemoryMb = Get-HostPhysicalMemoryMB
+    if (($null -ne $hostMemoryMb) -and ($memory -gt $hostMemoryMb)) {
+        Write-EA11Warn "Memória configurada ($memory MB) excede a RAM física detectada do host ($hostMemoryMb MB). O QEMU ainda pode iniciar por overcommit, mas o host pode ficar instável."
+    }
 
     $hostHomeShare = $null
     $hostHomeShareMode = $null
@@ -1512,14 +2139,14 @@ function Invoke-QemuVMStart {
         if ($hostHomeShare) {
             if (Test-QemuVirtfsSupport -QemuExecutable $qemuExecutable) {
                 $hostHomeShareMode = '9p'
-                Write-EA11Info "Compartilhando host home via virtfs: $($hostHomeShare.HostPath) -> $($hostHomeShare.GuestMountPoint)"
+                Write-EA11Info "Compartilhando host home via 9p: $($hostHomeShare.HostPath) -> $($hostHomeShare.GuestMountPoint)"
             }
             else {
                 $smbSupportInfo = Get-QemuUserNetSmbSupportInfo -QemuExecutable $qemuExecutable
             }
 
             if (($hostHomeShareMode -ne '9p') -and $smbSupportInfo -and ($smbSupportInfo.Supported -or ($smbSupportInfo.Reason -ne 'unsupported'))) {
-                # Mantem o comportamento resiliente do ea11ctl-old: quando virtfs nao
+                # Mantem o comportamento resiliente no ea11ctl: quando 9p nao
                 # existe, tenta SMB usernet antes de desistir do compartilhamento.
                 # Se SMB quebrar em runtime, o bloco de retry abaixo ja reinicia sem share.
                 $hostHomeShareMode = 'smb'
@@ -1530,10 +2157,10 @@ function Invoke-QemuVMStart {
                     GuestMountPoint = $hostHomeShare.GuestMountPoint
                 }
                 if ($smbSupportInfo.Reason -eq 'missing-host-smb-helper') {
-                    Write-EA11Warn 'virtfs indisponivel. SMB usernet sera tentado, mas o helper SMB do host aparenta ausente; se falhar, o start seguira sem share automaticamente.'
+                    Write-EA11Warn 'virtfs/9p indisponivel. SMB usernet sera tentado, mas o helper SMB do host aparenta ausente, caso falhe, o start seguira sem share automaticamente.'
                 }
                 else {
-                    Write-EA11Warn "virtfs indisponivel neste QEMU. Usando fallback SMB (/qemu/ -> $($qemuSmbShare.GuestMountPoint))."
+                    Write-EA11Warn "virtfs/9p indisponivel neste QEMU. Usando fallback SMB (//10.0.2.4/qemu -> $($qemuSmbShare.GuestMountPoint))."
                 }
             }
             elseif ($hostHomeShareMode -ne '9p') {
@@ -1541,7 +2168,7 @@ function Invoke-QemuVMStart {
                     Write-EA11Warn 'QEMU ate possui parametro SMB usernet, mas o helper SMB do host nao esta disponivel. VM iniciada sem compartilhamento automatico da home do host.'
                 }
                 else {
-                    Write-EA11Warn 'Este binario QEMU nao suporta virtfs nem SMB usernet em runtime. VM iniciada sem compartilhamento automatico da home do host.'
+                    Write-EA11Warn 'Este binario QEMU nao suporta virtfs/9p nem SMB usernet em runtime. VM iniciada sem compartilhamento automatico da home do host.'
                 }
                 $hostHomeShare = $null
             }
@@ -1564,31 +2191,35 @@ function Invoke-QemuVMStart {
         $qemuArgs += @('-nographic', '-serial', 'stdio')
     }
     else {
-        if (Test-IsMacOSHost) {
-            $qemuArgs += @('-display', 'cocoa,zoom-to-fit=on,full-screen=on', '-k', 'en-us')
-        }
-        elseif (Test-IsWindowsHost) {
-            $qemuArgs += @('-display', 'sdl', '-full-screen')
-        }
+        $qemuArgs += Get-QemuDesktopDisplayArgs -FullscreenMode $fullscreenMode
 
         $qemuArgs += Get-QemuAudioArgs -Backend $audioBackend -SupportedDrivers $supportedAudioDrivers
     }
 
     Write-EA11Info "Iniciando VM QEMU '$vmName'..."
-    $argsLog = Join-Path $logsDir "$vmName-qemu-args.log"
-    ($qemuArgs -join [Environment]::NewLine) | Set-Content -Path $argsLog -Encoding UTF8
-    $startParams = @{
-        FilePath = $qemuExecutable
-        ArgumentList = $qemuArgs
-        PassThru = $true
-        RedirectStandardOutput = $stdoutLog
-        RedirectStandardError = $stderrLog
+    Write-QemuArgsLog -Path $argsLog -QemuExecutable $qemuExecutable -QemuArgs $qemuArgs
+    if ($debugMode) {
+        # Salva comando e log detalhado
+        Set-Content -Path $debugCmdFile -Value ("$qemuExecutable " + ($qemuArgs -join ' '))
+        $startParams = @{
+            FilePath = $qemuExecutable
+            ArgumentList = $qemuArgs
+            PassThru = $true
+            RedirectStandardOutput = $debugLogFile
+            RedirectStandardError = $debugLogFile
+        }
+    } else {
+        $startParams = @{
+            FilePath = $qemuExecutable
+            ArgumentList = $qemuArgs
+            PassThru = $true
+            RedirectStandardOutput = $stdoutLog
+            RedirectStandardError = $stderrLog
+        }
     }
-
     if ((Test-IsWindowsHost) -and $headless) {
         $startParams.WindowStyle = 'Hidden'
     }
-
     $proc = Start-Process @startParams
 
     Start-Sleep -Seconds 2
@@ -1616,16 +2247,12 @@ function Invoke-QemuVMStart {
                 $qemuArgs += @('-nographic', '-serial', 'stdio')
             }
             else {
-                if (Test-IsMacOSHost) {
-                    $qemuArgs += @('-display', 'cocoa,zoom-to-fit=on,full-screen=on', '-k', 'en-us')
-                }
-                elseif (Test-IsWindowsHost) {
-                    $qemuArgs += @('-display', 'sdl', '-full-screen')
-                }
+                $qemuArgs += Get-QemuDesktopDisplayArgs -FullscreenMode $fullscreenMode
 
                 $qemuArgs += Get-QemuAudioArgs -Backend $audioBackend -SupportedDrivers $supportedAudioDrivers
             }
 
+            Write-QemuArgsLog -Path $argsLog -QemuExecutable $qemuExecutable -QemuArgs $qemuArgs
             $startParams.ArgumentList = $qemuArgs
             $proc = Start-Process @startParams
             Start-Sleep -Seconds 2
@@ -1641,6 +2268,7 @@ function Invoke-QemuVMStart {
 
         if ($lastError -match 'WHPX|Unexpected VP exit code|APX|MPX') {
             Write-EA11Warn 'WHPX falhou no host atual. Retentando automaticamente com aceleracao TCG (modo compatibilidade)...'
+            $effectiveAccelMode = 'tcg'
 
             $qemuArgs = New-QemuBaseArgs -Memory $memory -Cpus $cpus -SystemDisk $systemDisk -UserDataDisk $userDataDisk -NetdevValue $netdevValue -NetDevice $netDevice -DiskInterface $diskInterface -DiskCache $diskCache -DiskDiscard $diskDiscard -VideoDevice $videoDevice -HostHomeShare $hostHomeShare -HostHomeShareMode $hostHomeShareMode -HostUser $hostUserForGuest
 
@@ -1650,16 +2278,12 @@ function Invoke-QemuVMStart {
                 $qemuArgs += @('-nographic', '-serial', 'stdio')
             }
             else {
-                if (Test-IsMacOSHost) {
-                    $qemuArgs += @('-display', 'cocoa,zoom-to-fit=on,full-screen=on', '-k', 'en-us')
-                }
-                elseif (Test-IsWindowsHost) {
-                    $qemuArgs += @('-display', 'sdl', '-full-screen')
-                }
+                $qemuArgs += Get-QemuDesktopDisplayArgs -FullscreenMode $fullscreenMode
 
                 $qemuArgs += Get-QemuAudioArgs
             }
 
+            Write-QemuArgsLog -Path $argsLog -QemuExecutable $qemuExecutable -QemuArgs $qemuArgs
             $startParams.ArgumentList = $qemuArgs
             $proc = Start-Process @startParams
             Start-Sleep -Seconds 2
@@ -1688,16 +2312,12 @@ function Invoke-QemuVMStart {
                 $qemuArgs += @('-nographic', '-serial', 'stdio')
             }
             else {
-                if (Test-IsMacOSHost) {
-                    $qemuArgs += @('-display', 'cocoa,zoom-to-fit=on,full-screen=on', '-k', 'en-us')
-                }
-                elseif (Test-IsWindowsHost) {
-                    $qemuArgs += @('-display', 'sdl', '-full-screen')
-                }
+                $qemuArgs += Get-QemuDesktopDisplayArgs -FullscreenMode $fullscreenMode
 
                 $qemuArgs += Get-QemuAudioArgs -Backend $fallbackAudio -SupportedDrivers $supportedAudioDrivers
             }
 
+            Write-QemuArgsLog -Path $argsLog -QemuExecutable $qemuExecutable -QemuArgs $qemuArgs
             $startParams.ArgumentList = $qemuArgs
             $proc = Start-Process @startParams
             Start-Sleep -Seconds 2
@@ -1707,10 +2327,19 @@ function Invoke-QemuVMStart {
 
     if (-not $alive) {
         $lastError = ''
-        if (Test-Path $stderrLog) {
+        if ($debugMode -and (Test-Path $debugLogFile)) {
+            $lastError = (Get-Content -Path $debugLogFile -Tail 40 -ErrorAction SilentlyContinue) -join [Environment]::NewLine
+            Write-EA11Error "Falha ao iniciar QEMU para '$vmName'."
+            Write-EA11Error "Veja o comando usado em: $debugCmdFile"
+            Write-EA11Error "Veja o log detalhado em: $debugLogFile"
+            Write-Host $lastError
+            throw "Falha ao iniciar QEMU para '$vmName'. Veja logs em $debugLogFile e comando em $debugCmdFile."
+        } elseif (Test-Path $stderrLog) {
             $lastError = (Get-Content -Path $stderrLog -Tail 20 -ErrorAction SilentlyContinue) -join [Environment]::NewLine
+            throw "Falha ao iniciar QEMU para '$vmName'. Log: $stderrLog`n$lastError"
+        } else {
+            throw "Falha ao iniciar QEMU para '$vmName'."
         }
-        throw "Falha ao iniciar QEMU para '$vmName'. Log: $stderrLog`n$lastError"
     }
 
     Save-QemuState -VMName $vmName -State @{
@@ -1724,6 +2353,7 @@ function Invoke-QemuVMStart {
         homeMount = '/home'
         stdoutLog = $stdoutLog
         stderrLog = $stderrLog
+        qemuArgsLog = $argsLog
         hostHomeSharePath = if ($hostHomeShare) { $hostHomeShare.HostPath } else { $null }
         hostHomeShareTag = if ($hostHomeShare) { $hostHomeShare.MountTag } else { $null }
         hostHomeShareMode = if ($hostHomeShareMode) { $hostHomeShareMode } else { $null }
@@ -1737,6 +2367,7 @@ function Invoke-QemuVMStart {
     Write-Host "VM: $vmName"
     Write-Host "Backend: qemu"
     Write-Host "PID: $($proc.Id)"
+    Show-QemuLaunchSummary -VMName $vmName -Memory $memory -Cpus $cpus -AccelMode $effectiveAccelMode -CpuModel $effectiveCpuModel -NetDevice $netDevice -DiskInterface $diskInterface -DiskCache $diskCache -DiskDiscard $diskDiscard -VideoDevice $videoDevice -FullscreenMode $fullscreenMode -Headless:$headless -SshPort $sshPort -QemuExecutable $qemuExecutable -ArgsLog $argsLog
     Write-Host "SSH: localhost:$sshPort"
     Write-Host "Sistema: $systemDisk"
     Write-Host "Dados (/home): $userDataDisk"
@@ -1744,7 +2375,8 @@ function Invoke-QemuVMStart {
         Write-Host "Host home (9p): $($hostHomeShare.HostPath) -> $($hostHomeShare.GuestMountPoint)"
     }
     elseif (($hostHomeShareMode -eq 'smb') -and $hostHomeShare -and $qemuSmbShare) {
-        Write-Host "Host home (SMB): $($hostHomeShare.HostPath) -> //$($qemuSmbShare.Server)/$($qemuSmbShare.Share) -> $($qemuSmbShare.GuestMountPoint)"
+        $guestMount = if ($hostHomeGuestMountPoint) { [string]$hostHomeGuestMountPoint } else { '/home/hosthome' }
+        Write-Host "Host home (SMB): $($hostHomeShare.HostPath) -> //$($qemuSmbShare.Server)/$($qemuSmbShare.Share) -> $guestMount"
     }
 }
 
@@ -2268,7 +2900,7 @@ function Close-VMWindowProcess {
     foreach ($proc in $candidates) {
         Write-EA11Info "Solicitando fechamento da janela da VM '$VMName' (PID $($proc.ProcessId))"
 
-        # Fechamento gracioso: evita corromper estado interno do VirtualBox.
+        # Fechamento gracioso: evita corromper estado interno do Qemu.
         Stop-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
     }
 }
@@ -2397,24 +3029,46 @@ function Invoke-VMShareFolder {
     }
 }
 
+function Invoke-VMHostShare {
+    param([string[]]$Tokens)
+
+    if ($null -eq $Tokens -or $Tokens.Length -eq 0) {
+        $Tokens = @('list')
+    }
+
+    $action = $Tokens[0]
+    switch ($action) {
+        'list' {
+            $rest = @()
+            if ($Tokens.Length -gt 1) {
+                $rest = $Tokens[1..($Tokens.Length - 1)]
+            }
+            Invoke-VMShareFolder -Tokens (@('list') + $rest)
+        }
+        default {
+            throw "Acao desconhecida de host-share: $action. Use: ea11ctl vm host-share list"
+        }
+    }
+}
+
 function Invoke-HostInstall {
     param([string[]]$InstallArgs)
     
     # Host install é apenas disponível em sistemas Linux/macOS nativo
     # Windows deve usar VM, pois não há pacotes Debian/Ubuntu nativos
     throw @"
-Erro: 'host install' nao eh suportado no Windows.
+Erro: 'host install' nao e suportado no Windows.
 
 No Windows, use apenas:
   ea11ctl vm install (baixa a imagem VM Debian pre-configurada)
   ea11ctl vm start    (inicia a VM com Emacs + espeakup)
 
-A instalacao nativa (host install) eh suportada apenas em:
+A instalacao nativa (host install) e suportada apenas em:
   - Linux com Debian 11+/Ubuntu 20.04+
   - macOS (com bash shell nativo)
 
-Se desejar testar host install no Windows, considere usar WSL:
-  1. Instale Windows Subsystem for Linux (WSL)
+Se desejar testar host install no Windows, considere usar WSL2:
+  1. Instale Windows Subsystem for Linux (WSL2)
   2. Instale Debian ou Ubuntu dentro do WSL
   3. Execute: ea11ctl host install
 
@@ -2495,20 +3149,28 @@ function Invoke-VMCommand {
         { $_ -in @('ssh', '-x') } {
             Invoke-QemuVMSSH -Tokens $rest
         }
+        { $_ -in @('share-folder', '-F') } {
+            Invoke-VMShareFolder -Tokens $rest
+        }
+        { $_ -in @('host-share', '-H') } {
+            Invoke-VMHostShare -Tokens $rest
+        }
         default { throw "Subcomando vm desconhecido: $sub" }
     }
 }
 
-try {
-    if ($Args.Length -eq 0) {
+function Invoke-RootCommand {
+    param([string[]]$Tokens)
+
+    if ($null -eq $Tokens -or $Tokens.Length -eq 0) {
         Show-Help
-        exit 0
+        return
     }
 
-    $root = $Args[0]
+    $root = $Tokens[0]
     $rest = @()
-    if ($Args.Length -gt 1) {
-        $rest = $Args[1..($Args.Length - 1)]
+    if ($Tokens.Length -gt 1) {
+        $rest = $Tokens[1..($Tokens.Length - 1)]
     }
 
     switch ($root) {
@@ -2527,9 +3189,568 @@ try {
         }
     }
 }
-catch {
-    Write-EA11Error $_.Exception.Message
+
+function Get-InteractivePrompt {
+    param([string]$Context)
+
+    switch ($Context) {
+        'vm' { return 'ea11ctl vm> ' }
+        'vm_config' { return 'ea11ctl vm config> ' }
+        'vm_host_share' { return 'ea11ctl vm host-share> ' }
+        'host' { return 'ea11ctl host> ' }
+        default { return 'ea11ctl> ' }
+    }
+}
+
+function Show-InteractiveContextHelp {
+    param([string]$Context)
+
+    switch ($Context) {
+        'vm' {
+            @"
+Comandos de VM:
+
+install        instala a VM
+list           lista VMs
+start          inicia a VM
+stop           para a VM
+close          fecha a VM
+remove         remove a VM
+delete         remove a VM (alias)
+diagnose       diagnostica a VM
+status         mostra status da VM
+ssh            conecta via SSH
+host-share     entra em compartilhamento do host
+config         entra em configuração da VM
+optimize       otimiza a VM
+debug          ativa/desativa debug da sessão (on|off|status)
+back           volta
+exit           sai
+
+Exemplos:
+
+status
+start --headless
+start --debug
+diagnose -T -L 80
+ssh
+"@ | Write-Host
+        }
+        'vm_config' {
+            @"
+Configuração da VM:
+
+show     mostra configuração amigável
+--raw    mostra configuração técnica (QEMU_*)
+list     lista chaves configuráveis
+get      consulta um valor (ex.: get memory)
+set      altera um valor (ex.: set memory 4096)
+path     mostra caminho da configuração
+reset    redefine configuração da VM
+help     mostra ajuda do vm config
+back     volta
+exit     sai
+
+Exemplos:
+
+show
+--raw
+list
+get memory
+set memory 8192
+set memory=8192 cpus=4 fullscreen=off
+path
+reset
+"@ | Write-Host
+        }
+        'vm_host_share' {
+            @"
+Compartilhamento do host:
+
+list     lista compartilhamentos
+back     volta
+exit     sai
+
+Exemplo:
+
+list
+"@ | Write-Host
+        }
+        'host' {
+            @"
+Instalação nativa no host:
+
+install  inicia a instalação nativa
+back     volta
+exit     sai
+
+Exemplo:
+
+install
+"@ | Write-Host
+        }
+        default {
+            @"
+Comandos disponíveis:
+
+version       mostra a versão do ea11ctl
+self-update   atualiza o ea11ctl
+update        alias de self-update
+uninstall     desinstala a CLI local
+vm            entra no contexto de VM
+host          entra no contexto de instalação nativa
+status        mostra o status da VM padrão
+debug         ativa/desativa debug da sessão (on|off|status)
+clear         limpa a tela
+exit          sai
+
+Exemplos:
+
+vm
+vm status
+vm start --headless
+debug on
+self-update -f
+"@ | Write-Host
+        }
+    }
+}
+
+function Get-ContextCommandList {
+    param([string]$Context)
+
+    switch ($Context) {
+        'vm' { return @('help','?','install','list','start','stop','close','remove','delete','diagnose','status','ssh','host-share','config','optimize','debug','back','exit','quit','clear') }
+        'vm_config' { return @('help','?','show','--raw','list','get','set','path','reset','debug','back','exit','quit','clear') }
+        'vm_host_share' { return @('help','?','list','debug','back','exit','quit','clear') }
+        'host' { return @('help','?','install','debug','back','exit','quit','clear') }
+        default { return @('help','?','version','self-update','update','uninstall','vm','host','status','debug','clear','exit','quit') }
+    }
+}
+
+function Set-InteractiveDebugMode {
+    param([string]$Mode = 'status')
+
+    switch ($Mode.ToLowerInvariant()) {
+        { $_ -in @('on','1','true') } {
+            $env:EA11_DEBUG = '1'
+            Write-Host 'DEBUG ativado para esta sessão interativa.'
+        }
+        { $_ -in @('off','0','false') } {
+            Remove-Item Env:EA11_DEBUG -ErrorAction SilentlyContinue
+            Write-Host 'DEBUG desativado para esta sessão interativa.'
+        }
+        'status' {
+            if ($env:EA11_DEBUG -eq '1') {
+                Write-Host 'DEBUG está ativado.'
+            }
+            else {
+                Write-Host 'DEBUG está desativado.'
+            }
+        }
+        default {
+            Write-Host "Valor inválido para debug: $Mode"
+            Write-Host 'Use: debug on | debug off | debug status'
+        }
+    }
+}
+
+function Show-CommandSuggestion {
+    param(
+        [string]$Context,
+        [string]$Typed
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Typed)) {
+        return
+    }
+
+    $suggestions = New-Object System.Collections.Generic.List[string]
+
+    foreach ($cmd in (Get-ContextCommandList -Context $Context)) {
+        if ($cmd.StartsWith($Typed, [System.StringComparison]::OrdinalIgnoreCase) -or
+            ($cmd.IndexOf($Typed, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) {
+            $suggestions.Add($cmd)
+        }
+    }
+
+    if ($suggestions.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Talvez você quis dizer:'
+        foreach ($s in $suggestions) {
+            Write-Host $s
+        }
+    }
+}
+
+function Test-ContextHasCommand {
+    param(
+        [string]$Context,
+        [string]$Token
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return $false
+    }
+
+    foreach ($cmd in (Get-ContextCommandList -Context $Context)) {
+        if ($cmd.Equals($Token, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Is-RootToken {
+    param([string]$Token)
+
+    return $Token -in @('help','?','version','--version','self-update','update','uninstall','vm','host','status','debug','clear','exit','quit')
+}
+
+function Normalize-InteractiveAliases {
+    param(
+        [string]$Context,
+        [string[]]$Tokens
+    )
+
+    if ($null -eq $Tokens -or $Tokens.Length -eq 0) {
+        return @()
+    }
+
+    $normalized = @($Tokens)
+
+    if ($normalized[0] -eq 'update') {
+        $normalized[0] = 'self-update'
+    }
+
+    if ($Context -eq 'vm' -and $normalized[0] -eq 'delete') {
+        $normalized[0] = 'remove'
+    }
+
+    return $normalized
+}
+
+function Resolve-ContextCommand {
+    param(
+        [string]$Context,
+        [string[]]$Tokens
+    )
+
+    $result = @{
+        Action = 'dispatch'
+        NextContext = $Context
+        Command = @()
+    }
+
+    if ($null -eq $Tokens -or $Tokens.Length -eq 0) {
+        $result.Action = 'noop'
+        return $result
+    }
+
+    $first = $Tokens[0]
+    switch ($first) {
+        'help' { $result.Action = 'help'; return $result }
+        '?' { $result.Action = 'help'; return $result }
+        'debug' { $result.Action = 'debug_toggle'; $result.Command = @($Tokens); return $result }
+        'exit' { $result.Action = 'exit'; return $result }
+        'quit' { $result.Action = 'exit'; return $result }
+        'clear' { $result.Action = 'clear'; return $result }
+        'back' {
+            $result.Action = 'back'
+            switch ($Context) {
+                'vm' { $result.NextContext = 'root' }
+                'host' { $result.NextContext = 'root' }
+                'vm_config' { $result.NextContext = 'vm' }
+                'vm_host_share' { $result.NextContext = 'vm' }
+                default { $result.NextContext = 'root' }
+            }
+            return $result
+        }
+        'status' {
+            if ($Context -in @('root','vm')) {
+                $result.Action = 'dispatch'
+                $result.Command = @('vm','status')
+            }
+            else {
+                $result.Action = 'status_unavailable'
+            }
+            return $result
+        }
+    }
+
+    switch ($Context) {
+        'root' {
+            if ($first -eq 'vm' -and $Tokens.Length -eq 1) {
+                $result.Action = 'enter_context'
+                $result.NextContext = 'vm'
+                return $result
+            }
+            if ($first -eq 'host' -and $Tokens.Length -eq 1) {
+                $result.Action = 'enter_context'
+                $result.NextContext = 'host'
+                return $result
+            }
+            $result.Command = @($Tokens)
+        }
+        'vm' {
+            if ($first -eq 'config' -and $Tokens.Length -eq 1) {
+                $result.Action = 'enter_context'
+                $result.NextContext = 'vm_config'
+                return $result
+            }
+            if ($first -eq 'host-share' -and $Tokens.Length -eq 1) {
+                $result.Action = 'enter_context'
+                $result.NextContext = 'vm_host_share'
+                return $result
+            }
+
+            if (Is-RootToken -Token $first) {
+                $result.Command = @($Tokens)
+            }
+            else {
+                $result.Command = @('vm') + @($Tokens)
+            }
+        }
+        'vm_config' {
+            if (Is-RootToken -Token $first -or $first -in @('vm','host')) {
+                $result.Command = @($Tokens)
+            }
+            else {
+                $result.Command = @('vm','config') + @($Tokens)
+            }
+        }
+        'vm_host_share' {
+            if (Is-RootToken -Token $first -or $first -in @('vm','host')) {
+                $result.Command = @($Tokens)
+            }
+            else {
+                if ($first -eq 'list') {
+                    # No Windows atual, mapeia para share-folder list.
+                    $tail = @()
+                    if ($Tokens.Length -gt 1) {
+                        $tail = @($Tokens[1..($Tokens.Length - 1)])
+                    }
+                    $result.Command = @('vm','share-folder','list') + $tail
+                }
+                else {
+                    $result.Command = @('vm','host-share') + @($Tokens)
+                }
+            }
+        }
+        'host' {
+            if (Is-RootToken -Token $first -or $first -in @('vm','host')) {
+                $result.Command = @($Tokens)
+            }
+            else {
+                $result.Command = @('host') + @($Tokens)
+            }
+        }
+        default {
+            $result.Command = @($Tokens)
+        }
+    }
+
+    return $result
+}
+
+function Is-SensitiveCommand {
+    param([string[]]$Command)
+
+    if ($null -eq $Command -or $Command.Length -eq 0) {
+        return $false
+    }
+
+    switch ($Command[0]) {
+        'uninstall' { return $true }
+        'host' {
+            if ($Command.Length -ge 2 -and $Command[1] -in @('install','-i')) { return $true }
+        }
+        'vm' {
+            if ($Command.Length -ge 2 -and $Command[1] -in @('remove','-r','delete')) { return $true }
+            if ($Command.Length -ge 3 -and $Command[1] -eq 'config' -and $Command[2] -eq 'reset') { return $true }
+        }
+        'self-update' {
+            if (-not (Has-Flag -Tokens $Command -Flags @('--force','-f'))) { return $true }
+        }
+    }
+
+    return $false
+}
+
+function Show-SensitiveNotice {
+    param([string[]]$Command)
+
+    if ($Command.Length -ge 3 -and $Command[0] -eq 'vm' -and $Command[1] -eq 'config' -and $Command[2] -eq 'reset') {
+        Write-Host 'Esta ação pode redefinir configurações da VM.'
+        Write-Host 'Nenhuma configuração pessoal deve ser apagada sem confirmação explícita.'
+        return
+    }
+
+    if ($Command.Length -ge 2 -and $Command[0] -eq 'host' -in @('install','-i')) {
+        Write-Host 'Esta ação iniciará a instalação nativa no host.'
+        Write-Host 'Ela pode instalar pacotes e alterar arquivos do sistema.'
+        return
+    }
+
+    if ($Command.Length -ge 2 -and $Command[0] -eq 'vm' -in @('remove','-r','delete')) {
+        Write-Host 'Esta ação pode remover arquivos da VM.'
+        return
+    }
+
+    if ($Command[0] -eq 'uninstall') {
+        Write-Host 'Esta ação pode desinstalar a CLI local.'
+        return
+    }
+
+    if ($Command[0] -eq 'self-update') {
+        Write-Host 'Esta ação atualiza a CLI e altera arquivos locais da instalação.'
+        return
+    }
+
+    Write-Host 'Esta ação altera estado persistente.'
+}
+
+function Confirm-SensitiveCommand {
+    param([string[]]$Command)
+
     Write-Host ''
-    Show-Help
-    exit 1
+    Write-Host 'Comando equivalente:'
+    Write-Host ('ea11ctl ' + ($Command -join ' '))
+    Write-Host ''
+    Show-SensitiveNotice -Command $Command
+
+    $reply = Read-Host 'Continuar? [s/N]'
+    if ([string]::IsNullOrWhiteSpace($reply)) {
+        Write-Host 'Ação cancelada.'
+        return $false
+    }
+
+    switch ($reply.Trim().ToLowerInvariant()) {
+        's' { return $true }
+        'sim' { return $true }
+        'y' { return $true }
+        'yes' { return $true }
+        default {
+            Write-Host 'Ação cancelada.'
+            return $false
+        }
+    }
+}
+
+function Start-InteractiveShell {
+    Write-Host 'ea11ctl - modo interativo'
+    Write-Host ''
+    Write-Host 'Digite help para ver comandos.'
+    Write-Host 'Digite exit para sair.'
+    Write-Host ''
+
+    $script:IsInteractiveShell = $true
+    try {
+        $context = 'root'
+        while ($true) {
+            $promptText = Get-InteractivePrompt -Context $context
+            $line = Read-Host -Prompt ($promptText -replace '>\s$','')
+            if ($null -eq $line) {
+                break
+            }
+
+            $trimmed = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) {
+                continue
+            }
+
+            # Saida imediata para comandos globais de encerramento.
+            if ($trimmed -match '^(?i)\s*(exit|quit)\s*$') {
+                break
+            }
+
+            # Parser simples: separa por espacos.
+            $tokens = $trimmed -split '\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            $tokens = Normalize-InteractiveAliases -Context $context -Tokens $tokens
+            $resolved = Resolve-ContextCommand -Context $context -Tokens $tokens
+
+            switch ($resolved.Action) {
+                'noop' { continue }
+                'help' { Show-InteractiveContextHelp -Context $context; continue }
+                'clear' { Clear-Host; continue }
+                'exit' { break }
+                'back' {
+                    if ($context -eq 'root') {
+                        Write-Host 'Você já está no contexto raiz.'
+                    }
+                    else {
+                        $context = [string]$resolved.NextContext
+                    }
+                    continue
+                }
+                'enter_context' {
+                    $context = [string]$resolved.NextContext
+                    continue
+                }
+                'status_unavailable' {
+                    Write-Host 'Não há status específico neste contexto.'
+                    continue
+                }
+                'debug_toggle' {
+                    $mode = 'status'
+                    if ($tokens.Length -ge 2) {
+                        $mode = [string]$tokens[1]
+                    }
+                    Set-InteractiveDebugMode -Mode $mode
+                    continue
+                }
+            }
+
+            $cmd = @($resolved.Command)
+            if ($cmd.Length -eq 0) {
+                continue
+            }
+
+            if (Is-SensitiveCommand -Command $cmd) {
+                if (-not (Confirm-SensitiveCommand -Command $cmd)) {
+                    continue
+                }
+            }
+
+            try {
+                Invoke-RootCommand -Tokens $cmd
+            }
+            catch {
+                if (-not [string]::IsNullOrWhiteSpace($_.Exception.Message)) {
+                    Write-EA11Error $_.Exception.Message
+                }
+                if (-not (Test-ContextHasCommand -Context $context -Token $tokens[0])) {
+                    Write-Host ''
+                    Write-Host "Comando desconhecido: $($tokens[0])"
+                    Show-CommandSuggestion -Context $context -Typed $tokens[0]
+                }
+                Write-Host ''
+                Write-Host 'Digite help para ver os comandos disponíveis.'
+            }
+        }
+    }
+    finally {
+        $script:IsInteractiveShell = $false
+    }
+}
+
+
+if ($Args.Length -eq 0) {
+    # Modo interativo: nunca sair com erro por comando inválido
+    try {
+        Start-InteractiveShell
+    } catch {
+        Write-EA11Error $_.Exception.Message
+    }
+    exit 0
+} else {
+    try {
+        Invoke-RootCommand -Tokens $Args
+    } catch {
+        Write-EA11Error $_.Exception.Message
+        Write-Host ''
+        Show-Help
+        exit 1
+    }
 }
