@@ -2,7 +2,7 @@
 param(
     [switch]$NoForceReinstall,
     [switch]$Force,
-    # Parâmetros legados
+    # Parâmetros legados do sistema
     [string]$Owner,
     [string]$Repo,
     [string]$Branch
